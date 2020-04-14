@@ -1,0 +1,711 @@
+base_keys:
+- input
+- events
+- event_proximity
+- user_assignment
+- verify
+- final_table
+- job_tables
+- clean_export
+base_input: |2
+
+  set query_group to 'ONION';
+
+  drop table if exists input_variables_temp;
+  create temp table input_variables_temp as (
+      select {distance}::int as distance1
+      ,{capacity_override}::int as capacity_override
+      ,{assumed_acceptance_rate} as assumed_acceptance_rate
+      ,{active_event_filters} as active_event_filters
+  );
+base_where_criteria:
+  date_range: and ee.starts_at between getdate() + interval '{date_range[0]} days'
+    and getdate() + interval '{date_range[1]} days'
+  date_abs: and date(ee.starts_at) between '{date_abs[0]}' and '{date_abs[1]}'
+  campaign_id_in: and ee.campaign_id in ({campaign_id_in})
+  campaign_name: and ec.name = '{campaign_name}'
+  state_in: and ee.state in ({state_in})
+  state_not_in: and ee.state not in ({state_not_in})
+  state_eq: and ee.state = '{state_eq}'
+  ak_id_in: and ee.id in ({ak_id_in})
+  mob_id_in: and xwalk.mobilize_id in ({mob_id_in})
+base_events: "\n--base_events\ndrop table if exists events;\ncreate temp table events\
+  \ as (\n    select ee.id as event_id\n        ,xwalk.mobilize_id\n        ,ec.title\
+  \ as event_category\n        ,ec.name as event_category_name\n        ,ee.title\
+  \ as event_title\n        ,ee.city as event_city\n        ,ee.zip as event_zip\n\
+  \        ,ee.state as event_state\n        ,to_date(ee.starts_at,'YYYY-MM-DD') as\
+  \ event_date\n        ,ee.status\n        ,null::int as event_distance_override\n\
+  \        ,coalesce(\n            (select capacity_override from input_variables_temp)\n\
+  \            ,case\n                when ec.name = 'community-canvass' then least(ee.max_attendees,25)\
+  \ end\n            ,case\n                when ec.name = 'debate-watch-party' then\
+  \ least(ee.max_attendees,100) end\n            ,case\n                when ec.name\
+  \ in ('bernie-town-hall','bernie-rally-campaign') then 10000\n                else\
+  \ coalesce(max_attendees,20)\n            end) as capacity\n        ,ee.attendee_count\n\
+  \        ,ee.starts_at as event_start\n        from ak_bernie.events_event ee\n\
+  \        join ak_bernie.events_campaign ec on ec.id = ee.campaign_id\n        join\
+  \ waterfall.events_xwalk_mini xwalk on xwalk.ak_id = ee.id\n        where extract(hour\
+  \ from ee.starts_at) between 6 and 21\n        and ee.status='active' --turn off\
+  \ for sbs events only\n        and ee.is_approved=true -- turn off for sbs events\
+  \ only\n        and ee.is_private=false --turn off for sbs events only\n       \
+  \ and ee.zip is not null\n{where_sql}\n    );\n    \nselect * from events;\n"
+base_event_proximity: "\n--base_event_proximity\ndrop table if exists event_proximity;\n\
+  create temp table event_proximity as (\n    select users.*\n    ,events_distance.*\n\
+  \    ,row_number() over (partition by users.external_id,mobilize_id order by random())\
+  \ as mobilize_shift_assignment\n    from (\n        select u.external_id\n     \
+  \   ,u.first_name\n        ,u.last_name\n        ,u.phone\n        ,u.zip\n    \
+  \    ,u.state\n        from (\n            select * from (\n            select 'ak_'\
+  \ || cu.id::varchar as external_id\n            ,'actionkit' as external_id_type\n\
+  \            ,cu.first_name\n            ,cu.last_name\n            ,cu.zip\n  \
+  \          ,cu.state\n            ,apc.phone\n            ,row_number() over (partition\
+  \ by apc.phone order by cu.created_at desc) rank_recency\n            from\n   \
+  \         ak_bernie.core_user cu\n            left join bernie_data_commons.contactcontacts_joined\
+  \ ccj on ccj.actionkit_id = cu.id\n            join bernie_data_commons.apcd_ak\
+  \ apc on apc.actionkit_id = cu.id\n            where apc.cell_rank_for_person =\
+  \ 1\n            and (support_int in(1,2) or support_int is null))rec\n        \
+  \    where rec.rank_recency=1\n\n            union all\n\n            select 'dnc_'\
+  \ || cc.person_id::varchar as external_id\n            ,'person_id' as external_id_type\n\
+  \            ,cc.contact_first_name as first_name\n            ,cc.contact_last_name\
+  \ as last_name\n            ,cc.voter_zip as zip\n            ,cc.voter_state as\
+  \ state\n            ,apc.phone\n            ,1 as rank_recency\n            from\
+  \ bernie_data_commons.contactcontacts_joined cc\n            join bernie_data_commons.apcd_dnc\
+  \ apc on apc.person_id = cc.person_id\n            where cc.actionkit_id is null\
+  \ -- make sure we're not pulling duplicate records by excluding anyone we've matched\
+  \ to actionkit\n            and cc.person_id is not null\n            and support_int\
+  \ in ({support_ints})\n            and apc.cell_rank_for_person = 1\n          \
+  \  and unique_id_flag=true\n            group by 1,2,3,4,5,6,7\n            \n \
+  \       ) u -- combined users table\n        group by 1,2,3,4,5,6\n    ) users\n\
+  \    join (\n        select events.*\n        ,zp.zip_2\n        ,zp.distance\n\
+  \        from events\n        join bernie_data_commons.zip_proximity_new zp on zp.zip_1\
+  \ = events.event_zip\n    ) events_distance on events_distance.zip_2 = users.zip\n\
+  \ --       and events_distance.event_state = users.state\n        and events_distance.distance\
+  \ <= coalesce(events_distance.event_distance_override,(select distance1 from input_variables_temp))\n\
+  \    {exclusions_sql}\n);\n\n"
+base_user_assignment: "\n--event_proximity count\nselect count(*) from event_proximity;\n\
+  \n-- adds a column ranking how close an event is to a user\ndrop table if exists\
+  \ event_proximity_ranked;\ncreate temp table event_proximity_ranked as (\n    select\
+  \ *\n    ,row_number() over (partition by external_id order by distance) as proximity_rank\n\
+  \    ,row_number() over (partition by event_id order by distance) as user_rank_for_event\n\
+  \    from event_proximity\n    where mobilize_shift_assignment = 1 \n);\n\n-- adds\
+  \ a column randomly determining the order in which we will call users to attend\
+  \ the event\ndrop table if exists event_user_assignment_ranked;\ncreate temp table\
+  \ event_user_assignment_ranked as (\n    select epr.*\n    ,event_assignments.proximity_rank_assignment\n\
+  \    from (\n        select external_id\n        ,min(case -- looks at whether the\
+  \ top 5 events near a user are full and assigns them to the closest event that still\
+  \ needs more texts\n            when proximity_rank = 1 and user_priority <= ((capacity\
+  \ - attendee_count)/(select assumed_acceptance_rate from input_variables_temp))\
+  \ then 1\n            when proximity_rank = 2 and user_priority <= ((capacity -\
+  \ attendee_count)/(select assumed_acceptance_rate from input_variables_temp)) then\
+  \ 2\n            when proximity_rank = 3 and user_priority <= ((capacity - attendee_count)/(select\
+  \ assumed_acceptance_rate from input_variables_temp)) then 3\n            when proximity_rank\
+  \ = 4 and user_priority <= ((capacity - attendee_count)/(select assumed_acceptance_rate\
+  \ from input_variables_temp)) then 4\n            when proximity_rank = 5 and user_priority\
+  \ <= ((capacity - attendee_count)/(select assumed_acceptance_rate from input_variables_temp))\
+  \ then 5\n            end\n            ) as proximity_rank_assignment\n        from\
+  \ (\n            select *\n            ,row_number() over (partition by event_id,\
+  \ proximity_rank order by distance) as user_priority\n            from event_proximity_ranked\n\
+  \        ) closest_events\n        group by 1\n    ) event_assignments\n    join\
+  \ event_proximity_ranked epr on epr.external_id = event_assignments.external_id\n\
+  );\n\n-- adds a column randomly determining the order in which we will call users\
+  \ to attend the event\ndrop table if exists event_user_assignment_modified;\ncreate\
+  \ temp table event_user_assignment_modified as (\n    select euar.*\n    ,case\n\
+  \        when event_assignment_override.external_id is not null and euar.event_id\
+  \ = 33878 then 1\n        when event_assignment_override.external_id is not null\
+  \ then null\n        else euar.proximity_rank_assignment\n        end as modified_event_assignment\n\
+  \    from event_user_assignment_ranked euar\n    left join (\n        select euar.external_id\n\
+  \        from event_user_assignment_ranked euar\n        where euar.event_id = 33878\
+  \ and user_rank_for_event < 1000\n    ) event_assignment_override on event_assignment_override.external_id\
+  \ = euar.external_id\n);\n"
+base_verify: "\n-- Verify\nselect *\n,case when closest_event>=texts_needed then 1\
+  \ else 0 end as sufficient_phones_closest\n,case when all_users>=texts_needed then\
+  \ 1 else 0 end as sufficient_phones_all\nfrom (\n    select \n     event_id\n  \
+  \  ,event_title\n    ,event_date --add to review that we are grabbing correct shift\
+  \ dates here \n    ,capacity\n    ,capacity - attendee_count as rsvps_needed\n \
+  \   ,(capacity - attendee_count)/(select assumed_acceptance_rate from input_variables_temp)\
+  \ as texts_needed\n    ,count(case when proximity_rank=1 then external_id end) as\
+  \ closest_event\n    ,count(external_id) as all_users\n    ,count(case when proximity_rank\
+  \ = modified_event_assignment then external_id end) as assigned_users\n    from\
+  \ event_user_assignment_modified\n    group by 1,2,3,4,5\n) x;\n"
+base_overrides:
+  venue_override:
+  - '''{venue_override}'' as event1_venue'
+  - waterfall.f_venue_clean(ee.venue) as venue1
+  title_override:
+  - '''{title_override}'' as event1_event_title'
+  - coalesce(combo.title, replace(ee.title,'!','')) as event_title1
+  combo_override:
+  - '''{combo_override}'' as combo'
+  - "coalesce(combo.combo, \n                case when ee.venue='Unnamed venue' then\
+    \ 'We''ll meet at '||ee.address1||'.'\n                     when ee.venue='Private\
+    \ venue'or ee.venue ilike '%TBD%' then null\n                     else 'We''ll\
+    \ meet at '||waterfall.f_venue_clean(ee.venue)||' at '||ee.address1||'.' end)\
+    \ as combo_meal1"
+base_final_table: "\ndrop table if exists {table_name};\nCREATE TABLE {table_name}\
+  \ (\n    \"firstname\" CHARACTER VARYING(100) ENCODE zstd NULL,\n    \"lastname\"\
+  \ CHARACTER VARYING(100) ENCODE zstd NULL,\n    \"cell\" CHARACTER VARYING(100)\
+  \ ENCODE zstd NULL,\n    \"zip\" CHARACTER VARYING(100) ENCODE zstd NULL,\n    \"\
+  external_id\" CHARACTER VARYING(100) ENCODE zstd NULL,\n    \"state1\" CHARACTER\
+  \ VARYING(100) ENCODE zstd NULL,\n    \"day1\" CHARACTER VARYING(100) ENCODE zstd\
+  \ NULL,\n    \"time1\" CHARACTER VARYING(100) ENCODE zstd NULL,\n    \"address1\"\
+  \ CHARACTER VARYING(500) ENCODE zstd NULL,\n    \"city1\" CHARACTER VARYING(100)\
+  \ ENCODE zstd NULL,\n    \"venue1\" CHARACTER VARYING(500) ENCODE zstd NULL,\n \
+  \   \"event_title1\" CHARACTER VARYING(500) ENCODE zstd NULL,\n    \"combo_meal1\"\
+  \ CHARACTER VARYING(1024) ENCODE zstd NULL,\n    \"event_category1\" CHARACTER VARYING(50)\
+  \ ENCODE zstd NULL,\n    \"link1\" CHARACTER VARYING(500) ENCODE zstd NULL,\n  \
+  \  \"ak_event_id\" CHARACTER VARYING(100) ENCODE zstd NULL,\n    \"mobilize_id\"\
+  \ CHARACTER VARYING(100) ENCODE zstd NULL,\n    \"mobilize_timeslot_id\" CHARACTER\
+  \ VARYING(100) ENCODE zstd NULL,\n    \"van_event_van_id\" CHARACTER VARYING(100)\
+  \ ENCODE zstd NULL,\n    \"van_timeslot_id\" CHARACTER VARYING(100) ENCODE zstd\
+  \ NULL\n);\ninsert into {table_name}(\n        select coalesce(initcap(case when\
+  \ nr.name_pattern is null then ea.first_name end),'friend') end as firstName\n \
+  \   ,initcap(ea.last_name) as lastName\n    ,'+1' || ea.phone::varchar as cell\n\
+  \    ,ea.zip\n    ,ea.external_id\n    ,sa.state\n    ,trim(to_char(ee.starts_at,\
+  \ 'Day'))\n        || ', '\n        || trim(to_char(ee.starts_at, 'Mon'))\n    \
+  \    || ' '\n        || trim(to_char(ee.starts_at, 'DD'))::int::varchar\n      \
+  \  as event1_date\n    ,case\n        when left(to_char(ee.starts_at, 'HH12:MI AM'),1)\
+  \ = '0' then substring(to_char(ee.starts_at, 'HH12:MI AM'),2)\n        else to_char(ee.starts_at,\
+  \ 'HH12:MI AM')\n        end as event1_time\n    ,ee.address1 as event1_address1\n\
+  \    ,initcap(event_city) as event1_city\n    {overrides_sql}\n    ,initcap(replace(event_category,'-','\
+  \ ')) as event1_category\n    ,'/event/mobilize/'||xw.mobilize_id::varchar as event1_link\
+  \ \n    --,'/event/' || ec.name || '/' || ee.id::varchar end as event1_link ---use\
+  \ for sbs events and solidarity    \n    ,ee.id as ak_event_id\n    ,xw.mobilize_id\n\
+  \    ,xw.mobilize_timeslot_id\n    ,xw.van_event_van_id\n    ,xw.van_timeslot_id\n\
+  \    from event_user_assignment_modified ea\n    join ak_bernie.events_event ee\
+  \ on ee.id = ea.event_id\n    join ak_bernie.events_campaign ec on ec.id = ee.campaign_id\n\
+  \    join waterfall.state_abbreviation sa on ee.state = sa.abbreviation\n    left\
+  \ join core_table_builds.events_xwalk xw on xw.ak_event_id=ee.id\n    left join\
+  \ waterfall.name_replace nr on fistname ilike nr.name_pattern\n    left join waterfall.combos\
+  \ combo on combo.job_id = {job_id} and combo.mobilize_id = ea.mobilize_id\n\n  \
+  \  where proximity_rank = modified_event_assignment\n    order by random()\n);"
+base_job_tables: |2
+
+  -- base_job_tables
+  insert into waterfall.job_tables (
+      select {job_id},
+             '{table_name}',
+             event_state,
+             getdate(),
+             max(date(e.event_date))
+      from events e
+      group by event_state);
+base_clean_export: "\n--base_clean_export\n------------------------------------------------------------\n\
+  ----CHECK FOR VARIABLE UPDATES----CHECK FOR VARIABLE UPDATES\n------------------------------------------------------------\n\
+  -- Venues\nselect distinct event1_event_title, event1_venue, event1_address1,combo\
+  \ from {table_name};\n\n------------------------------------------------------------\n\
+  ----MAKING UPDATES----MAKING UPDATES----MAKING UPDATES------ \n------------------------------------------------------------\n\
+  \n--update {table_name}\n--set venue1 = 'the Field Office'\n--where venue1 ilike\
+  \ '%HQ%';\n\n--update {table_name}\n--set venue1 = 'the Field Office'\n--where true;\n\
+  \n--update {table_name}\n--set event_title1 = 'Barnstorm'\n--where true;\n\n--update\
+  \ {table_name}\n--set combo_meal1=case when venue1='Unnamed venue' then 'We''ll\
+  \ meet at '||address1||'.' \n--                      when venue1='Private venue'\
+  \ then null \n--                      else 'We''ll meet at '||venue1||' at '||address1||'.\
+  \ ' end\n--where true;\n\n------------------------------------------------------------\n\
+  ----REVIEW NUMBERS & EXPORT-----REVIEW NUMBERS & EXPORT----\n------------------------------------------------------------\n\
+  -- First row\nselect * from {table_name} limit 1;\n-- Count\nselect count(*) from\
+  \ {table_name};\n-- Final\nselect * from {table_name};\n"
+watf_where_criteria:
+  date_range: and ee.starts_at between getdate() + interval '{date_range[0]} days'
+    and getdate() + interval '{date_range[1]} days'
+  date_abs: and date(ee.starts_at) between '{date_abs[0]}' and '{date_abs[1]}'
+  campaign_id_in: and ee.campaign_id in ({campaign_id_in})
+  campaign_name: and ec.name = '{campaign_name}'
+  state_in: and ee.state in ({state_in})
+  state_not_in: and ee.state not in ({state_not_in})
+  state_eq: and ee.state = '{state_eq}'
+  ak_id_in: and ee.id in ({ak_id_in})
+  mob_id_in: and xwalk.mobilize_id in ({mob_id_in})
+  job_id_in: and jr.job_id in ({job_id_in})
+  req_id_in: and jr.request_id in ({req_id_in})
+watf_events: "\n--watf_events\ndrop table if exists events;\ncreate temp table events\
+  \ as (\n    select distinct ee.id as event_id\n        ,xwalk.mobilize_id\n    \
+  \    ,ec.title as event_category\n        ,ec.name as event_category_name\n    \
+  \    ,jr.ak_title as event_title\n        ,ee.city as event_city\n        ,ee.zip\
+  \ as event_zip\n        ,ee.state as event_state\n        ,ee.address1\n       \
+  \ ,ee.venue\n        ,to_date(ee.starts_at,'YYYY-MM-DD') as event_date\n       \
+  \ ,ee.status\n        ,ee.campaign_id\n        ,coalesce(NULLIF(jr.distance,0),\
+  \ input_variables_temp.distance1) as event_distance_override\n        ,jr.capacity\n\
+  \        ,jr.combo as combo\n        ,jr.event1_link as event_link\n        ,jr.van_event_van_id\n\
+  \        ,jr.mobilize_timeslot_id\n        ,jr.van_timeslot_id\n        ,ee.attendee_count\n\
+  \        ,ee.starts_at as event_start\n        ,jr.job_id as job_id\n        from\
+  \ ak_bernie.events_event ee\n        join ak_bernie.events_campaign ec on ec.id\
+  \ = ee.campaign_id\n        join waterfall.events_xwalk_mini xwalk on xwalk.ak_id\
+  \ = ee.id\n        join waterfall.job_requests jr on jr.mobilize_id = xwalk.mobilize_id\n\
+  \        , input_variables_temp\n        where extract(hour from ee.starts_at) between\
+  \ 6 and 21\n        and ee.status='active' --turn off for sbs events only\n    \
+  \    and ee.is_approved=true -- turn off for sbs events only\n        and ee.is_private=false\
+  \ --turn off for sbs events only\n        and ee.zip is not null\n{where_sql}\n\
+  \    );\n    \nselect * from events;\n"
+watf_event_proximity: "\n--watf_event_proximity\ndrop table if exists event_proximity;\n\
+  create temp table event_proximity as (\n    select users.*\n    ,events_distance.*\n\
+  \    ,row_number() over (partition by users.external_id,mobilize_id order by random())\
+  \ as mobilize_shift_assignment\n    from (\n        select u.external_id\n     \
+  \   ,u.first_name\n        ,u.last_name\n        ,u.phone\n        ,u.zip\n    \
+  \    ,u.state\n        from (\n            select * from (\n            select 'ak_'\
+  \ || cu.id::varchar as external_id\n            ,'actionkit' as external_id_type\n\
+  \            ,cu.first_name\n            ,cu.last_name\n            ,cu.zip\n  \
+  \          ,cu.state\n            ,apc.phone\n            ,row_number() over (partition\
+  \ by apc.phone order by cu.created_at desc) rank_recency\n            from\n   \
+  \         ak_bernie.core_user cu\n            left join bernie_data_commons.contactcontacts_joined\
+  \ ccj on ccj.actionkit_id = cu.id\n            join bernie_data_commons.apcd_ak\
+  \ apc on apc.actionkit_id = cu.id\n            where apc.cell_rank_for_person =\
+  \ 1\n            and (support_int in(1,2) or support_int is null))rec\n        \
+  \    where rec.rank_recency=1\n\n            union all\n\n            select 'dnc_'\
+  \ || cc.person_id::varchar as external_id\n            ,'person_id' as external_id_type\n\
+  \            ,cc.contact_first_name as first_name\n            ,cc.contact_last_name\
+  \ as last_name\n            ,cc.voter_zip as zip\n            ,cc.voter_state as\
+  \ state\n            ,apc.phone\n            ,1 as rank_recency\n            from\
+  \ bernie_data_commons.contactcontacts_joined cc\n            join bernie_data_commons.apcd_dnc\
+  \ apc on apc.person_id = cc.person_id\n            where cc.actionkit_id is null\
+  \ -- make sure we're not pulling duplicate records by excluding anyone we've matched\
+  \ to actionkit\n            and cc.person_id is not null\n            and support_int\
+  \ in ({support_ints})\n            and apc.cell_rank_for_person = 1\n          \
+  \  and unique_id_flag=true\n            group by 1,2,3,4,5,6,7\n            \n \
+  \       ) u -- combined users table\n        group by 1,2,3,4,5,6\n    ) users\n\
+  \    join (\n        select events.*\n        ,zp.zip_2\n        ,zp.distance\n\
+  \        from events\n        join bernie_data_commons.zip_proximity_new zp on zp.zip_1\
+  \ = events.event_zip\n    ) events_distance on events_distance.zip_2 = users.zip\n\
+  \ --       and events_distance.event_state = users.state\n        and events_distance.distance\
+  \ <= events_distance.event_distance_override\n    {exclusions_sql}\n);\n\n"
+watf_overrides:
+  title_override:
+  - '''{title_override}'' as event_title1'
+  - ea.event_title as event_title1
+  combo_override:
+  - '''{combo_override}'' as combo_meal1'
+  - ea.combo as combo_meal1
+watf_final_table: "\n--watf_final_table\ndrop table if exists {table_name};\nCREATE\
+  \ TABLE {table_name} (\n    \"firstname\" CHARACTER VARYING(100) ENCODE zstd NULL,\n\
+  \    \"lastname\" CHARACTER VARYING(100) ENCODE zstd NULL,\n    \"cell\" CHARACTER\
+  \ VARYING(15) ENCODE zstd NULL,\n    \"zip\" CHARACTER VARYING(15) ENCODE zstd NULL,\n\
+  \    \"external_id\" CHARACTER VARYING(100) ENCODE zstd NULL,\n    \"state1\" CHARACTER\
+  \ VARYING(40) ENCODE zstd NULL,\n    \"day1\" CHARACTER VARYING(100) ENCODE zstd\
+  \ NULL,\n    \"time1\" CHARACTER VARYING(100) ENCODE zstd NULL,\n    \"address1\"\
+  \ CHARACTER VARYING(500) ENCODE zstd NULL,\n    \"venue1\" CHARACTER VARYING(500)\
+  \ ENCODE zstd NULL,\n    \"city1\" CHARACTER VARYING(100) ENCODE zstd NULL,\n  \
+  \  event_title1 CHARACTER VARYING(100) ENCODE zstd NULL,\n    combo_meal1 CHARACTER\
+  \ VARYING(500) ENCODE zstd NULL,\n    \"event_category1\" CHARACTER VARYING(50)\
+  \ ENCODE zstd NULL,\n    \"link1\" CHARACTER VARYING(500) ENCODE zstd NULL,\n  \
+  \  job_id CHARACTER VARYING(10) ENCODE zstd NULL,\n    \"ak_event_id\" CHARACTER\
+  \ VARYING(100) ENCODE zstd NULL,\n    \"mobilize_id\" integer NULL,\n    \"mobilize_timeslot_id\"\
+  \ integer NULL,\n    \"van_event_van_id\" integer NULL,\n    \"van_timeslot_id\"\
+  \ integer ENCODE zstd NULL\n);\n\ninsert into {table_name}(\n    select coalesce(initcap(case\
+  \ when nr.name_pattern is null then left(ea.first_name,99) end),'friend') as firstName\n\
+  \    ,initcap(ea.last_name) as lastName\n    ,'+1' || ea.phone::varchar as cell\n\
+  \    ,ea.zip\n    ,ea.external_id\n    ,sa.state\n    ,trim(to_char(ea.event_start,\
+  \ 'Day'))\n        || ', '\n        || trim(to_char(ea.event_start, 'Mon'))\n  \
+  \      || ' '\n        || trim(to_char(ea.event_start, 'DD'))::int::varchar\n  \
+  \      as event1_date\n    ,case\n        when left(to_char(ea.event_start, 'HH12:MI\
+  \ AM'),1) = '0' then substring(to_char(ea.event_start, 'HH12:MI AM'),2)\n      \
+  \  else to_char(ea.event_start, 'HH12:MI AM')\n        end as event1_time\n    ,ea.address1\
+  \ as address\n    ,ea.venue as venue1\n    ,initcap(event_city) as event1_city\n\
+  \    \n    {overrides_sql}\n\n    ,initcap(replace(event_category,'-',' ')) as event1_category\n\
+  \    ,ea.event_link\n    --,'/event/' || ec.name || '/' || ee.id::varchar end as\
+  \ event1_link ---use for sbs events and solidarity\n    ,ea.job_id\n    ,ea.event_id\
+  \ as ak_event_id\n    ,ea.mobilize_id\n    ,ea.mobilize_timeslot_id\n    ,ea.van_event_van_id\n\
+  \    ,ea.van_timeslot_id\n    from event_user_assignment_modified ea\n    join ak_bernie.events_campaign\
+  \ ec on ec.id = ea.campaign_id\n    join waterfall.state_abbreviation sa on ea.event_state\
+  \ = sa.abbreviation\n    left join waterfall.name_replace nr on ea.first_name ilike\
+  \ nr.name_pattern\n\n    where proximity_rank = modified_event_assignment\n    order\
+  \ by random()\n);\n"
+watf_job_tables: |2
+
+  -- watf_job_tables
+  insert into waterfall.job_tables (
+      select job_id,
+             '{table_name}',
+             event_state,
+             getdate(),
+             max(date(e.event_date))
+      from events e
+      group by job_id, event_state);
+watf_clean_export: "\n------------------------------------------------------------\n\
+  ----CHECK FOR VARIABLE UPDATES----CHECK FOR VARIABLE UPDATES\n------------------------------------------------------------\n\
+  -- Venues\nselect distinct event_title1, combo_meal1 from {table_name};\n\n------------------------------------------------------------\n\
+  ----MAKING UPDATES----MAKING UPDATES----MAKING UPDATES------ \n------------------------------------------------------------\n\
+  \n--update {table_name}\n--set venue1 = 'the Field Office'\n--where venue1 ilike\
+  \ '%HQ%';\n\n--update {table_name}\n--set venue1 = 'the Field Office'\n--where true;\n\
+  \n--update {table_name}\n--set event_title1 = 'Barnstorm'\n--where true;\n\n------------------------------------------------------------\n\
+  ----REVIEW NUMBERS & EXPORT-----REVIEW NUMBERS & EXPORT----\n------------------------------------------------------------\n\
+  -- First row\nselect * from {table_name} limit 1;\n-- Count\nselect count(*) from\
+  \ {table_name};\n-- Final\nselect * from {table_name};\n"
+bulk_parent_importer: watf
+bulk_where_criteria:
+  date_range: and ee.starts_at between getdate() + interval '{date_range[0]} days'
+    and getdate() + interval '{date_range[1]} days'
+  date_abs: and date(ee.starts_at) between '{date_abs[0]}' and '{date_abs[1]}'
+  campaign_id_in: and ee.campaign_id in ({campaign_id_in})
+  campaign_name: and ec.name = '{campaign_name}'
+  state_in: and ee.state in ({state_in})
+  state_not_in: and ee.state not in ({state_not_in})
+  state_eq: and ee.state = '{state_eq}'
+  ak_id_in: and ee.id in ({ak_id_in})
+  mob_id_in: and xwalk.mobilize_id in ({mob_id_in})
+  job_id_in: and jr.job_id in ({job_id_in})
+bulk_events: "\n\n--bulk_events\ndrop table if exists events;\ncreate temp table events\
+  \ as (\n    select distinct ee.id as event_id\n        ,xwalk.mobilize_id\n    \
+  \    ,ec.title as event_category\n        ,ec.name as event_category_name\n    \
+  \    ,jr.ak_title as event_title\n        ,ee.city as event_city\n        ,ee.zip\
+  \ as event_zip\n        ,ee.state as event_state\n        ,ee.address1\n       \
+  \ ,ee.venue\n        ,to_date(ee.starts_at,'YYYY-MM-DD') as event_date\n       \
+  \ ,ee.status\n        ,ee.campaign_id\n        ,coalesce(NULLIF(jr.distance,0),\
+  \ input_variables_temp.distance1) as event_distance_override\n        ,jr.capacity\n\
+  \        ,jr.combo as combo\n        ,jr.event1_link as event_link\n        ,jr.van_event_van_id\n\
+  \        ,jr.mobilize_timeslot_id\n        ,jr.van_timeslot_id\n        ,ee.attendee_count\n\
+  \        ,ee.starts_at as event_start\n        ,jr.job_id as job_id\n        from\
+  \ ak_bernie.events_event ee\n        join ak_bernie.events_campaign ec on ec.id\
+  \ = ee.campaign_id\n        join waterfall.events_xwalk_mini xwalk on xwalk.ak_id\
+  \ = ee.id\n        join waterfall.job_bulk_requests jr on jr.ak_event_id = ee.id\n\
+  \        , input_variables_temp\n        where extract(hour from ee.starts_at) between\
+  \ 6 and 21\n        and ee.status='active' --turn off for sbs events only\n    \
+  \    and ee.is_approved=true -- turn off for sbs events only\n        and ee.is_private=false\
+  \ --turn off for sbs events only\n        and ee.zip is not null\n{where_sql});\n\
+  \n    \nselect * from events;\n"
+merge_parent_importer: watf
+merge_where_criteria:
+  date_range: and ee.starts_at between getdate() + interval '{date_range[0]} days'
+    and getdate() + interval '{date_range[1]} days'
+  date_abs: and date(ee.starts_at) between '{date_abs[0]}' and '{date_abs[1]}'
+  campaign_id_in: and ee.campaign_id in ({campaign_id_in})
+  campaign_name: and ec.name = '{campaign_name}'
+  state_in: and ee.state in ({state_in})
+  state_not_in: and ee.state not in ({state_not_in})
+  state_eq: and ee.state = '{state_eq}'
+  ak_id_in: and ee.id in ({ak_id_in})
+  mob_id_in: and xwalk.mobilize_id in ({mob_id_in})
+  job_id_in: and jr.job_id in ({job_id_in})
+merge_events: |2+
+
+  --merge_events
+  drop table if exists events;
+  create temp table events as (
+      select distinct ee.id as event_id
+          ,xwalk.mobilize_id
+          ,ec.title as event_category
+          ,ec.name as event_category_name
+          ,jr.ak_title as event_title
+          ,ee.city as event_city
+          ,ee.zip as event_zip
+          ,ee.state as event_state
+          ,ee.address1
+          ,ee.venue
+          ,to_date(ee.starts_at,'YYYY-MM-DD') as event_date
+          ,ee.status
+          ,ee.campaign_id
+          ,coalesce(NULLIF(jr.distance,0)::integer, input_variables_temp.distance1) as event_distance_override
+          ,jr.capacity
+          ,jr.combo as combo
+          ,jr.event1_link as event_link
+          ,jr.van_event_van_id
+          ,jr.mobilize_timeslot_id
+          ,jr.van_timeslot_id
+          ,ee.attendee_count
+          ,ee.starts_at as event_start
+          ,jr.job_id as job_id
+          from ak_bernie.events_event ee
+          join ak_bernie.events_campaign ec on ec.id = ee.campaign_id
+          join waterfall.events_xwalk_mini xwalk on xwalk.ak_id = ee.id
+          join waterfall.job_bulk_requests jr on jr.ak_event_id = ee.id
+          , input_variables_temp
+          where extract(hour from ee.starts_at) between 6 and 21
+          and ee.status='active' --turn off for sbs events only
+          and ee.is_approved=true -- turn off for sbs events only
+          and ee.is_private=false --turn off for sbs events only
+          and ee.zip is not null
+  {where_sql}
+  union distinct
+
+  select distinct ee.id as event_id
+          ,xwalk.mobilize_id
+          ,ec.title as event_category
+          ,ec.name as event_category_name
+          ,jr.ak_title as event_title
+          ,ee.city as event_city
+          ,ee.zip as event_zip
+          ,ee.state as event_state
+          ,ee.address1
+          ,ee.venue
+          ,to_date(ee.starts_at,'YYYY-MM-DD') as event_date
+          ,ee.status
+          ,ee.campaign_id
+          ,coalesce(NULLIF(jr.distance,0)::integer, input_variables_temp.distance1) as event_distance_override
+          ,jr.capacity
+          ,jr.combo as combo
+          ,jr.event1_link as event_link
+          ,jr.van_event_van_id
+          ,jr.mobilize_timeslot_id
+          ,jr.van_timeslot_id
+          ,ee.attendee_count
+          ,ee.starts_at as event_start
+          ,jr.job_id as job_id
+          from ak_bernie.events_event ee
+          join ak_bernie.events_campaign ec on ec.id = ee.campaign_id
+          join waterfall.events_xwalk_mini xwalk on xwalk.ak_id = ee.id
+          join waterfall.job_requests jr on jr.mobilize_id = xwalk.mobilize_id
+          , input_variables_temp
+          where extract(hour from ee.starts_at) between 6 and 21
+          and ee.status='active' --turn off for sbs events only
+          and ee.is_approved=true -- turn off for sbs events only
+          and ee.is_private=false --turn off for sbs events only
+          and ee.zip is not null
+  {where_sql}
+  );
+
+
+bulk_constituency_parent_importer: bulk
+bulk_constituency_event_proximity: |2+
+
+
+  --bulk_constituency_event_proximity
+  drop table if exists event_proximity;
+  create temp table event_proximity as (
+    select users.*
+      ,events_distance.*
+      ,row_number() over (partition by users.external_id,mobilize_id order by random()) as mobilize_shift_assignment
+      from (
+          select u.external_id
+          ,u.firstname as first_name
+          ,u.lastname as last_name
+          ,u.phone
+          ,u.zip
+          ,u.state
+          from {constituency_view} u -- combined users table
+          group by 1,2,3,4,5,6
+      ) users
+      join (
+          select events.*
+          ,zp.zip_2
+          ,zp.distance
+          from events
+          join bernie_data_commons.zip_proximity_new zp on zp.zip_1 = events.event_zip
+      ) events_distance on events_distance.zip_2 = users.zip
+   --       and events_distance.event_state = users.state
+          and events_distance.distance <= events_distance.event_distance_override
+     {exclusions_sql}
+  );
+
+constituency_parent_importer: watf
+constituency_event_proximity: |2+
+
+
+  --constituency_event_proximity
+  drop table if exists event_proximity;
+  create temp table event_proximity as (
+    select users.*
+      ,events_distance.*
+      ,row_number() over (partition by users.external_id,mobilize_id order by random()) as mobilize_shift_assignment
+      from (
+          select u.external_id
+          ,u.firstname as first_name
+          ,u.lastname as last_name
+          ,u.phone
+          ,u.zip
+          ,u.state
+          from {constituency_view} u -- combined users table
+          group by 1,2,3,4,5,6
+      ) users
+      join (
+          select events.*
+          ,zp.zip_2
+          ,zp.distance
+          from events
+          join bernie_data_commons.zip_proximity_new zp on zp.zip_1 = events.event_zip
+      ) events_distance on events_distance.zip_2 = users.zip
+   --       and events_distance.event_state = users.state
+          and events_distance.distance <= events_distance.event_distance_override
+     {exclusions_sql}
+  );
+
+statewide_keys:
+- final_table
+- job_tables
+statewide_final_table: "\n\ndrop table if exists {table_name};\ncreate table {table_name}\
+  \ as (\nselect distinct u.external_id\n         , coalesce(initcap(case when nr.name_pattern\
+  \ is null then left(u.first_name, 25) end), 'friend') as firstName\n        ,u.last_name\
+  \ as lastName\n        ,'+1'||u.phone::varchar as cell\n        ,u.zip \n      \
+  \  ,u.state\n        ,'{link}' as link1\n        ,'{day}' as day1\n        ,'{time}'\
+  \ as time1\n        from (\n            select * from (\n            select 'ak_'\
+  \ || cu.id::varchar as external_id\n            ,'actionkit' as external_id_type\n\
+  \            ,cu.first_name\n            ,cu.last_name\n            ,cu.zip\n  \
+  \          ,cu.state\n            ,apc.phone\n            ,row_number() over (partition\
+  \ by apc.phone order by cu.created_at desc) rank_recency\n            from\n   \
+  \         ak_bernie.core_user cu\n            left join bernie_data_commons.contactcontacts_joined\
+  \ ccj on ccj.actionkit_id = cu.id\n            join bernie_data_commons.apcd_ak\
+  \ apc on apc.actionkit_id = cu.id\n            where apc.cell_rank_for_person =\
+  \ 1\n            and (support_int in(1,2) or support_int is null))rec\n        \
+  \    where rec.rank_recency=1\n\n            union all\n\n            select 'dnc_'\
+  \ || cc.person_id::varchar as external_id\n            ,'person_id' as external_id_type\n\
+  \            ,cc.contact_first_name as first_name\n            ,cc.contact_last_name\
+  \ as last_name\n            ,cc.voter_zip as zip\n            ,cc.voter_state as\
+  \ state\n            ,apc.phone\n            ,1 as rank_recency\n            from\
+  \ bernie_data_commons.contactcontacts_joined cc\n            join bernie_data_commons.apcd_dnc\
+  \ apc on apc.person_id = cc.person_id\n            where cc.actionkit_id is null\
+  \ -- make sure we're not pulling duplicate records by excluding anyone we've matched\
+  \ to actionkit\n            and cc.person_id is not null\n            and support_int\
+  \ in ({support_ints})\n            and apc.cell_rank_for_person = 1\n          \
+  \  and unique_id_flag=true\n            group by 1,2,3,4,5,6,7\n            \n \
+  \       ) u -- combined users table\n        left join waterfall.name_replace nr\
+  \ on u.first_name ilike nr.name_pattern\n\nwhere state in ('{state_in}')\n);\n"
+statewide_job_tables: |2
+
+  -- base_job_tables
+  insert into waterfall.job_tables (
+      select {job_id},
+             '{table_name}',
+             '{state_in}',
+             getdate(),
+             '{event_date}'
+      from {table_name} t;
+stateconst_keys:
+- final_table
+- job_tables
+stateconst_final_table: "\n\ndrop table if exists {table_name};\ncreate table {table_name}\
+  \ as (\nselect u.external_id\n         , coalesce(initcap(case when nr.name_pattern\
+  \ is null then left(u.first_name, 25) end), 'friend') as firstName\n        ,u.lastname\
+  \ \n        ,'+1'||u.phone::varchar as cell\n        ,u.zip\n        ,u.state as\
+  \ state1\n        ,'{link}' as link1\n        ,'{day}' as day1\n        ,'{time}'\
+  \ as time1\n\n        from {constituency_view} u\n                left join waterfall.name_replace\
+  \ nr on u.first_name ilike nr.name_pattern\n \nwhere u.state in ('{state_in}')\n\
+  );\n"
+stateconst_job_tables: |2
+
+  -- base_job_tables
+  insert into waterfall.job_tables (
+      select {job_id},
+             '{table_name}',
+             state1,
+             getdate(),
+             '{event_date}'
+      from {table_name} t
+      group by state1);
+merge_constituency_parent_importer: merge
+merge_constituency_event_proximity: |2+
+
+
+  --constituency_event_proximity
+  drop table if exists event_proximity;
+  create temp table event_proximity as (
+    select users.*
+      ,events_distance.*
+      ,row_number() over (partition by users.external_id,mobilize_id order by random()) as mobilize_shift_assignment
+      from (
+          select u.external_id
+          ,u.firstname as first_name
+          ,u.lastname as last_name
+          ,u.phone
+          ,u.zip
+          ,u.state
+          from {constituency_view} u -- combined users table
+          group by 1,2,3,4,5,6
+      ) users
+      join (
+          select events.*
+          ,zp.zip_2
+          ,zp.distance
+          from events
+          join bernie_data_commons.zip_proximity_new zp on zp.zip_1 = events.event_zip
+      ) events_distance on events_distance.zip_2 = users.zip
+   --       and events_distance.event_state = users.state
+          and events_distance.distance <= events_distance.event_distance_override
+     {exclusions_sql}
+  );
+
+foia_parent_importer: base
+foia_keys:
+- helper_table
+- input
+- events
+- event_proximity
+- user_assignment
+- verify
+- final_table
+- job_tables
+- clean_export
+foia_helper_table: |2
+
+  drop table if exists helper;
+  create temp table helper (mobilize_id integer, school_name varchar(max));
+  insert into helper VALUES {rows_statement};
+foia_events: "\n--foia_events\ndrop table if exists events;\ncreate temp table events\
+  \ as (\n    select ee.id as event_id\n        ,xwalk.mobilize_id\n        ,ec.title\
+  \ as event_category\n        ,ec.name as event_category_name\n        ,coalesce(combo.title,\
+  \ ee.title) as event_title\n        ,ee.city as event_city\n        ,ee.zip as event_zip\n\
+  \        ,ee.state as event_state\n        ,to_date(ee.starts_at,'YYYY-MM-DD') as\
+  \ event_date\n        ,ee.status\n        ,null::int as event_distance_override\n\
+  \        ,coalesce(\n            (select capacity_override from input_variables_temp)\n\
+  \            ,case\n                when ec.name = 'community-canvass' then least(ee.max_attendees,25)\
+  \ end\n            ,case\n                when ec.name = 'debate-watch-party' then\
+  \ least(ee.max_attendees,100) end\n            ,case\n                when ec.name\
+  \ in ('bernie-town-hall','bernie-rally-campaign') then 10000\n                else\
+  \ coalesce(max_attendees,20)\n            end) as capacity     \n        ,ee.attendee_count\n\
+  \        ,ee.starts_at as event_start\n        ,h.school_name as school_name\n \
+  \       from ak_bernie.events_event ee\n        join ak_bernie.events_campaign ec\
+  \ on ec.id = ee.campaign_id\n        join waterfall.events_xwalk_mini xwalk on xwalk.ak_id\
+  \ = ee.id\n        left join waterfall.combos combo on combo.mobilize_id = xwalk.mobilize_id\
+  \ and combo.job_id={job_id}\n        join helper h on h.mobilize_id = xwalk.mobilize_id\n\
+  \        where extract(hour from ee.starts_at) between 6 and 21\n        and ee.status='active'\
+  \ --turn off for sbs events only\n        and ee.is_approved=true -- turn off for\
+  \ sbs events only\n        and ee.is_private=false --turn off for sbs events only\n\
+  \        and ee.zip is not null\n{where_sql}\n    );\n    \nselect * from events;"
+foia_event_proximity: |2
+
+  --foia_event_proximity
+  drop table if exists event_proximity;
+  create temp table event_proximity as (
+      select users.*
+           , events_distance.*
+           , row_number() over (partition by users.external_id,mobilize_id order by random()) as mobilize_shift_assignment
+      from (
+               select u.external_id
+                    , u.first_name
+                    , u.last_name
+                    , u.phone
+                    , u.zip
+                    , u.state
+                    , u.institution_name
+               from (
+                        select firstname, lastname, phone, external_id, zip, state, NULL as institution_name
+                        from waterfall.vw_student
+
+                        union
+
+                        select first_name                         as firstname,
+                               last_name                          as lastname,
+                               coalesce(phone1, phone2)           as phone,
+                               'student_' || schools.student_hash as external_id,
+                               schools.zip                        as zip,
+                               schools.state                      as state1,
+                               schools.institution_name
+                        from student_data.all_schools_merged schools
+                                 left join (select 'student_' || json_extract_path_text(jsonid, 'student_hash') as student_hash
+                                            from bernie_data_commons.contactcontacts_joined
+                                            where json_extract_path_text(jsonid, 'student_hash') != ''
+                                              and support_int in (4, 5)) exclusions
+                                           on exclusions.student_hash = schools.student_hash
+                        where exclusions.student_hash is null
+
+                        union
+
+                        select initcap(ab.first_name)::varchar             as firstname,
+                               initcap(ab.last_name)::varchar              as lastname,
+                               '+1' || replace(ab.phone, '-', '')::varchar as cell,
+                               'bern_' || ab.user_id::varchar              as external_id,
+                               ab.zip_code                                 as zip,
+                               ab.state                                    as state1,
+                               ab.institution_name
+                        from bernie_data_commons.all_bern_users ab
+                    ) u -- combined users table
+               group by 1, 2, 3, 4, 5, 6
+           ) users
+               join (
+          select events.*
+               , zp.zip_2
+               , zp.distance
+          from events
+                   join bernie_data_commons.zip_proximity_new zp on zp.zip_1 = events.event_zip
+      ) events_distance on (events_distance.zip_2 = users.zip and
+                            events_distance.distance <= coalesce(events_distance.event_distance_override,
+                                                                 (select distance1 from input_variables_temp)))
+          or events.school_name = users.institution_name
+           --       and events_distance.event_state = users.state
+
+          {exclusions_sql}
+  );
